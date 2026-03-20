@@ -308,16 +308,6 @@ All contributions — code, design, feedback, translations, or just a kind word 
 ---
 
 
-<div align="center">
-
-```
-If this helped you ace an exam —
-star the repo ⭐
-tell a friend 📢
-and go sleep 😴
-```
-
-<br/>
 
 **Made with obsession for every student who's ever stared at a mountain of notes at midnight.**
 
