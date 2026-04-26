@@ -61,6 +61,19 @@ def extract_text_from_image(file_path):
     image = Image.open(file_path)
     return pytesseract.image_to_string(image)
 
+
+# Optional: show a preview of available models at startup (not a route)
+def available_models_preview(limit=10):
+    try:
+        models = genai.list_models()
+        return [m.name for m in models][:limit]
+    except Exception as e:
+        print("⚠️ Could not list models:", e)
+        return []
+
+print("Available Gemini/GenAI models preview:", available_models_preview())
+
+
 # -------- API Route: Upload & Extract -------- #
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
@@ -68,42 +81,47 @@ async def upload_file(file: UploadFile = File(...)):
         suffix = os.path.splitext(file.filename)[-1].lower()
         print("📂 Uploaded file:", file.filename, "Suffix:", suffix)
 
-        tmp_dir = tempfile.mkdtemp()
-        file_path = os.path.join(tmp_dir, file.filename)
+        # Use TemporaryDirectory for automatic cleanup
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path = os.path.join(tmp_dir, file.filename)
 
-        async with aiofiles.open(file_path, "wb") as out_file:
-            content = await file.read()
-            await out_file.write(content)
+            async with aiofiles.open(file_path, "wb") as out_file:
+                content = await file.read()
+                await out_file.write(content)
 
-        print("✅ File saved at:", file_path)
+            print("✅ File saved at:", file_path)
 
-        if suffix == ".pdf":
-            extracted_text = extract_text_from_pdf(file_path)
-        elif suffix == ".docx":
-            extracted_text = extract_text_from_docx(file_path)
-        elif suffix == ".txt":
-            extracted_text = extract_text_from_txt(file_path)
-        elif suffix in [".jpg", ".jpeg", ".png"]:
-            extracted_text = extract_text_from_image(file_path)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            if suffix == ".pdf":
+                extracted_text = extract_text_from_pdf(file_path)
+            elif suffix == ".docx":
+                extracted_text = extract_text_from_docx(file_path)
+            elif suffix == ".txt":
+                extracted_text = extract_text_from_txt(file_path)
+            elif suffix in [".jpg", ".jpeg", ".png"]:
+                extracted_text = extract_text_from_image(file_path)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file type")
 
-        print("📝 Extracted text (preview):", extracted_text[:200])
+            print("📝 Extracted text (preview):", extracted_text[:200])
 
-        if not extracted_text.strip():
-            raise HTTPException(status_code=400, detail="No readable text found in file")
+            if not extracted_text.strip():
+                raise HTTPException(status_code=400, detail="No readable text found in file")
 
-        # Ensure safe return with proper Unicode handling
-        safe_text = extracted_text.encode("utf-8", "replace").decode("utf-8")
-        return JSONResponse(content={"text": extracted_text})
+            # Ensure safe return with proper Unicode handling
+            safe_text = extracted_text.encode("utf-8", "replace").decode("utf-8")
+            return JSONResponse(content={"text": safe_text})
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("❌ Error:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # -------- API Route: Preprocess with Gemini -------- #
 class TextPayload(BaseModel):
     text: str
+
 
 @app.post("/preprocess/")
 async def preprocess_text(payload: TextPayload):
@@ -119,9 +137,6 @@ Carefully read the provided notes line by line.
 IMPORTANT: Use ONLY the notes provided below. 
 DO NOT add content not present in the notes. 
 Focus entirely on the concepts contained in the provided notes.
-
-You are an exam-focused AI tutor helping students revise.
-Carefully read the provided notes line by line.
 
 Your task:
 1. Identify ONLY exam-relevant content:
@@ -139,12 +154,12 @@ Expand explanations with examples, comparisons, and short clarifications when ne
 
 Output format (STRICT JSON only, no extra text outside JSON):
 [
-  {{
+  {
     "title": "Topic Name",
     "content": "Lecture-style explanation of exam-relevant points, written in a natural spoken style.",
     "importance": "high" | "medium",
     "duration": <estimated time in seconds to read aloud>
-  }}
+  }
 ]
 
 Guidelines:
@@ -154,29 +169,89 @@ Guidelines:
 - Ensure enough depth/detail to make the whole lecture 20–30 minutes when read aloud.
 - Estimate duration realistically (average ~120 words ≈ 60 seconds).
 - Distribute time across sections (some topics may need more, some less).
+"""
 
-        """
+        preferred_model = "models/gemini-1.5-flash"  # change if not available
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # defensive model listing
+        try:
+            model_names = [m.name for m in genai.list_models()]
+        except Exception as e:
+            print("⚠️ Warning: could not fetch model list:", e)
+            model_names = []
 
-        response = model.generate_content(
-            exam_prompt + "\n\nNotes:\n" + user_text,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        if preferred_model not in model_names:
+            # try to fall back
+            fallback = None
+            for candidate in model_names:
+                if "gemini" in candidate.lower() or "bison" in candidate.lower():
+                    fallback = candidate
+                    break
+
+            if fallback:
+                print(f"⚠️ Preferred model {preferred_model} not available, falling back to {fallback}")
+                use_model = fallback
+            else:
+                preview = model_names[:10] if model_names else "no models returned"
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Preferred model '{preferred_model}' not found. Available (preview): {preview}. "
+                           "Try updating your SDK or check your API access."
+                )
+        else:
+            use_model = preferred_model
+
+        full_input = exam_prompt + "\n\nNotes:\n" + user_text
+        response_text = None
+        raw_response = None
+
+        try:
+            ModelClass = getattr(genai, "GenerativeModel", None)
+            if ModelClass:
+                print("Using GenerativeModel API path with model:", use_model)
+                model_obj = ModelClass(use_model)
+                raw_response = model_obj.generate_content(
+                    full_input,
+                    generation_config={"response_mime_type": "application/json"}
+                )
+                if hasattr(raw_response, "text"):
+                    response_text = raw_response.text
+                elif hasattr(raw_response, "content"):
+                    response_text = raw_response.content
+                elif isinstance(raw_response, dict) and "candidates" in raw_response:
+                    response_text = raw_response["candidates"][0].get("content", "")
+                else:
+                    response_text = str(raw_response)
+            else:
+                print("Using genai.generate_text API path with model:", use_model)
+                raw = genai.generate_text(model=use_model, prompt=full_input, max_output_tokens=1024)
+                if hasattr(raw, "text"):
+                    response_text = raw.text
+                elif isinstance(raw, dict) and raw.get("candidates"):
+                    response_text = raw["candidates"][0].get("content", "")
+                else:
+                    response_text = str(raw)
+        except Exception as api_exc:
+            print("❌ Gemini API call failed:", api_exc)
+            raise HTTPException(status_code=500, detail=f"Gemini API call failed: {api_exc}")
 
         # Validate JSON safely
         try:
-            segments = json.loads(response.text)
+            segments = json.loads(response_text)
+            if not isinstance(segments, list):
+                raise ValueError("Expected a JSON list at top level")
         except Exception as parse_err:
-            print("❌ JSON Parse Error:", response.text[:500])
-            raise HTTPException(status_code=500, detail="Invalid JSON from Gemini")
+            print("❌ JSON Parse Error. Raw response preview:", (response_text or "")[:1000])
+            raise HTTPException(status_code=500, detail="Invalid JSON from Gemini or unexpected response shape")
 
         return JSONResponse(content={"status": "success", "segments": segments})
 
-
+    except HTTPException:
+        raise
     except Exception as e:
         print("❌ AI Error:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # -------- API Route: Convert to Audio with ElevenLabs -------- #
 class AudioPayload(BaseModel):
@@ -203,6 +278,7 @@ async def generate_audio(payload: AudioPayload):
             }
         }
 
+        # NOTE: requests is blocking. For production consider httpx.AsyncClient
         response = requests.post(url, headers=headers, json=body)
 
         if response.status_code != 200:
@@ -216,6 +292,8 @@ async def generate_audio(payload: AudioPayload):
 
         return FileResponse(output_path, media_type="audio/mpeg", filename="output.mp3")
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("❌ Audio Error:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
